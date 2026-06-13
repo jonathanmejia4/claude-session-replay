@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from . import parser as parser_module
 from .grouping import group_events_into_turns
 from .parser import inspect_types, normalize_events
 from .renderers import render_grouped_plain, render_markdown, render_plain
@@ -44,6 +45,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Only render the first N normalized events.",
     )
+    render_parser.add_argument(
+        "--max-width",
+        type=int,
+        default=None,
+        help="Truncate long fields to this many characters (default 220).",
+    )
+    render_parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Disable truncation of long fields (full text).",
+    )
 
     return parser
 
@@ -61,6 +73,11 @@ def main() -> int:
         for name, count in block_types.most_common():
             print(f"  {name}: {count}")
         return 0
+
+    if args.full:
+        parser_module.TRIM_MAX = 10_000_000
+    elif args.max_width is not None:
+        parser_module.TRIM_MAX = args.max_width
 
     events = list(
         normalize_events(

@@ -8,6 +8,8 @@ from typing import Any, Iterator
 
 from .models import ReplayEvent
 
+TRIM_MAX = 220
+
 
 def iter_jsonl(path: str | Path) -> Iterator[dict[str, Any]]:
     with Path(path).open("r", encoding="utf-8") as handle:
@@ -60,12 +62,11 @@ def normalize_events(
             continue
         if to_line is not None and line_number > to_line:
             continue
-        event = _normalize_record(record, include_tools=include_tools)
-        if event is not None:
+        for event in _normalize_record(record, include_tools=include_tools):
             yield event
 
 
-def _normalize_record(record: dict[str, Any], include_tools: bool) -> ReplayEvent | None:
+def _normalize_record(record: dict[str, Any], include_tools: bool) -> list[ReplayEvent]:
     event_type = record.get("type")
     timestamp = record.get("timestamp")
     line_number = record.get("_line_number")
@@ -78,7 +79,7 @@ def _normalize_record(record: dict[str, Any], include_tools: bool) -> ReplayEven
             if text:
                 task_note = _summarize_task_notification(text)
                 if task_note is not None:
-                    return ReplayEvent(
+                    return [ReplayEvent(
                         kind="task_notification",
                         timestamp=timestamp,
                         speaker="system",
@@ -86,8 +87,8 @@ def _normalize_record(record: dict[str, Any], include_tools: bool) -> ReplayEven
                         raw_type="user/task_notification",
                         metadata=_extract_task_notification_metadata(text),
                         raw=record,
-                    )
-                return ReplayEvent(
+                    )]
+                return [ReplayEvent(
                     kind="message",
                     timestamp=timestamp,
                     speaker="user",
@@ -95,25 +96,28 @@ def _normalize_record(record: dict[str, Any], include_tools: bool) -> ReplayEven
                     raw_type="user",
                     metadata={},
                     raw=record,
-                )
+                )]
 
         for block in _content_blocks(content):
             if block.get("type") == "tool_result" and include_tools:
                 result = _summarize_tool_result_content(block.get("content", ""))
-                return ReplayEvent(
+                metadata = _extract_tool_result_metadata(block.get("content", ""))
+                metadata["tool_use_id"] = block.get("tool_use_id")
+                return [ReplayEvent(
                     kind="tool_result",
                     timestamp=timestamp,
                     speaker="tool",
                     summary=f"tool_result[{block.get('tool_use_id', 'unknown')}]: {result}",
                     raw_type="user/tool_result",
-                    metadata=_extract_tool_result_metadata(block.get("content", "")),
+                    metadata=metadata,
                     raw=record,
-                )
-        return None
+                )]
+        return []
 
     if event_type == "assistant":
+        events: list[ReplayEvent] = []
         text_parts: list[str] = []
-        tool_parts: list[str] = []
+        tool_blocks: list[dict[str, Any]] = []
         for block in _content_blocks(record.get("message", {}).get("content")):
             block_type = block.get("type")
             if block_type == "text":
@@ -121,12 +125,10 @@ def _normalize_record(record: dict[str, Any], include_tools: bool) -> ReplayEven
                 if text:
                     text_parts.append(text)
             elif block_type == "tool_use" and include_tools:
-                name = str(block.get("name", "tool"))
-                tool_input = block.get("input", {})
-                tool_parts.append(f"{name}: {_summarize_tool_input(tool_input)}")
+                tool_blocks.append(block)
 
         if text_parts:
-            return ReplayEvent(
+            events.append(ReplayEvent(
                 kind="message",
                 timestamp=timestamp,
                 speaker="assistant",
@@ -134,27 +136,30 @@ def _normalize_record(record: dict[str, Any], include_tools: bool) -> ReplayEven
                 raw_type="assistant",
                 metadata={},
                 raw=record,
-            )
+            ))
 
-        if tool_parts and include_tools:
-            return ReplayEvent(
+        for block in tool_blocks:
+            name = str(block.get("name", "tool"))
+            tool_input = block.get("input", {})
+            metadata = _extract_single_tool_call_metadata(block)
+            events.append(ReplayEvent(
                 kind="tool_call",
                 timestamp=timestamp,
                 speaker="assistant",
-                summary="\n".join(tool_parts),
+                summary=f"{name}: {_summarize_tool_input(tool_input)}",
                 raw_type="assistant/tool_use",
-                metadata=_extract_tool_call_metadata(record.get("message", {}).get("content")),
+                metadata=metadata,
                 raw=record,
-            )
+            ))
 
-        return None
+        return events
 
     if event_type == "progress":
         data = record.get("data", {})
         task = data.get("taskDescription") or data.get("message", {}).get("type") or data.get("type")
         if not task:
             task = f"progress line {line_number}"
-        return ReplayEvent(
+        return [ReplayEvent(
             kind="status",
             timestamp=timestamp,
             speaker="system",
@@ -162,17 +167,17 @@ def _normalize_record(record: dict[str, Any], include_tools: bool) -> ReplayEven
             raw_type="progress",
             metadata={"progress_label": str(task)},
             raw=record,
-        )
+        )]
 
     if event_type == "queue-operation":
         operation = record.get("operation", "queue")
         content = _trim(str(record.get("content", "")))
         if operation in {"remove", "dequeue"} and not content:
-            return None
+            return []
         task_note = _summarize_task_notification(str(record.get("content", "")))
         if task_note is not None:
             content = task_note
-        return ReplayEvent(
+        return [ReplayEvent(
             kind="status",
             timestamp=timestamp,
             speaker="system",
@@ -180,9 +185,9 @@ def _normalize_record(record: dict[str, Any], include_tools: bool) -> ReplayEven
             raw_type="queue-operation",
             metadata=_extract_queue_operation_metadata(operation, str(record.get("content", ""))),
             raw=record,
-        )
+        )]
 
-    return None
+    return []
 
 
 def _content_blocks(content: Any) -> list[dict[str, Any]]:
@@ -271,25 +276,32 @@ def _extract_task_notification_metadata(text: str) -> dict[str, Any]:
     return metadata
 
 
+def _extract_single_tool_call_metadata(block: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    name = str(block.get("name", ""))
+    tool_input = block.get("input", {})
+    metadata["tool_name"] = name
+    if isinstance(tool_input, dict):
+        if "task_id" in tool_input:
+            metadata["task_id"] = str(tool_input["task_id"])
+        if "description" in tool_input:
+            metadata["task_name"] = str(tool_input["description"])
+        if "command" in tool_input:
+            metadata["command"] = str(tool_input["command"])
+        if "timeout" in tool_input:
+            metadata["timeout"] = tool_input["timeout"]
+        if "block" in tool_input:
+            metadata["block"] = tool_input["block"]
+    metadata["tool_use_id"] = block.get("id")
+    return metadata
+
+
 def _extract_tool_call_metadata(content: Any) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
     for block in _content_blocks(content):
         if block.get("type") != "tool_use":
             continue
-        name = str(block.get("name", ""))
-        tool_input = block.get("input", {})
-        metadata["tool_name"] = name
-        if isinstance(tool_input, dict):
-            if "task_id" in tool_input:
-                metadata["task_id"] = str(tool_input["task_id"])
-            if "description" in tool_input:
-                metadata["task_name"] = str(tool_input["description"])
-            if "command" in tool_input:
-                metadata["command"] = str(tool_input["command"])
-            if "timeout" in tool_input:
-                metadata["timeout"] = tool_input["timeout"]
-            if "block" in tool_input:
-                metadata["block"] = tool_input["block"]
+        metadata.update(_extract_single_tool_call_metadata(block))
     return metadata
 
 
@@ -340,7 +352,8 @@ def _extract_queue_operation_metadata(operation: str, content: str) -> dict[str,
     return metadata
 
 
-def _trim(text: str, max_length: int = 220) -> str:
+def _trim(text: str, max_length: int | None = None) -> str:
+    max_length = TRIM_MAX if max_length is None else max_length
     compact = " ".join(text.split())
     if len(compact) <= max_length:
         return compact

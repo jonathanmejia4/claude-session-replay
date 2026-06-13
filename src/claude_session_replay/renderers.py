@@ -46,31 +46,73 @@ def render_grouped_plain(turns: Iterable[ReplayTurn], compact: bool = False) -> 
                 parts.append(f"status: {rendered}")
         if turn.tool_call_events:
             task_names.update(_collect_task_names(turn.tool_call_events))
+            if turn.tool_result_events:
+                task_names.update(_collect_task_names(turn.tool_result_events))
+
+            results_by_id: dict[str, ReplayEvent] = {}
+            for result_event in turn.tool_result_events:
+                result_id = (result_event.metadata or {}).get("tool_use_id")
+                if result_id:
+                    results_by_id[str(result_id)] = result_event
+            consumed_ids: set[str] = set()
+
             for event in turn.tool_call_events:
                 if compact and _is_duplicate_launch_tool_event(event, turn.status_events):
                     continue
                 rendered = _humanize_tool_call_event(event, task_names=task_names) if compact else event.summary
                 parts.append(f"action: {rendered}" if compact else f"tool: {rendered}")
+
+                call_id = (event.metadata or {}).get("tool_use_id")
+                if call_id and str(call_id) in results_by_id:
+                    paired = results_by_id[str(call_id)]
+                    parts.extend(_emit_result_lines(paired, task_names, compact, indent="  "))
+                    consumed_ids.add(str(call_id))
+
+            for event in turn.tool_result_events:
+                result_id = (event.metadata or {}).get("tool_use_id")
+                if result_id and str(result_id) in consumed_ids:
+                    continue
+                parts.extend(_emit_result_lines(event, task_names, compact, indent=""))
         elif turn.tool_calls:
             for line in turn.tool_calls:
                 parts.append(f"tool: {line}")
-        if turn.tool_result_events:
+            if turn.tool_result_events:
+                task_names.update(_collect_task_names(turn.tool_result_events))
+                for event in turn.tool_result_events:
+                    parts.extend(_emit_result_lines(event, task_names, compact, indent=""))
+            elif turn.tool_results:
+                for line in turn.tool_results:
+                    parts.append(f"result: {line}")
+        elif turn.tool_result_events:
             task_names.update(_collect_task_names(turn.tool_result_events))
             for event in turn.tool_result_events:
-                expanded = _expanded_tool_result_block(event, task_names=task_names) if compact else None
-                if expanded is not None:
-                    label, content = expanded
-                    parts.append("")
-                    parts.extend(_render_expanded_block(label, content))
-                    parts.append("")
-                    continue
-                rendered = _humanize_tool_result_event(event, task_names=task_names) if compact else event.summary
-                parts.append(f"result: {rendered}")
+                parts.extend(_emit_result_lines(event, task_names, compact, indent=""))
         elif turn.tool_results:
             for line in turn.tool_results:
                 parts.append(f"result: {line}")
         parts.append("")
     return "\n".join(parts).rstrip() + "\n"
+
+
+def _emit_result_lines(
+    event: ReplayEvent,
+    task_names: dict[str, tuple[str, int]],
+    compact: bool,
+    indent: str = "",
+) -> list[str]:
+    lines: list[str] = []
+    expanded = _expanded_tool_result_block(event, task_names=task_names) if compact else None
+    if expanded is not None:
+        label, content = expanded
+        lines.append("")
+        for block_line in _render_expanded_block(label, content):
+            for physical in block_line.split("\n"):
+                lines.append(f"{indent}{physical}" if (indent and physical) else physical)
+        lines.append("")
+        return lines
+    rendered = _humanize_tool_result_event(event, task_names=task_names) if compact else event.summary
+    lines.append(f"{indent}result: {rendered}")
+    return lines
 
 
 def _header(event: ReplayEvent) -> str:

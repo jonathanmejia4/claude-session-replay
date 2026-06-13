@@ -292,6 +292,84 @@ def test_compact_grouped_render_expands_long_completed_subagent_output() -> None
     assert long_output.strip() in rendered
 
 
+def test_grouped_render_interleaves_results_under_matching_calls() -> None:
+    from claude_session_replay.models import ReplayEvent
+
+    turn = ReplayTurn(
+        speaker="assistant",
+        timestamp="2026-01-01T00:00:00Z",
+        title="Assistant",
+        body="Doing two things.",
+    )
+    turn.tool_call_events.append(
+        ReplayEvent(
+            kind="tool_call",
+            timestamp=None,
+            speaker="assistant",
+            summary="Read: file_a",
+            raw_type="assistant/tool_use",
+            metadata={"tool_name": "Read", "tool_use_id": "call_a"},
+            raw={},
+        )
+    )
+    turn.tool_call_events.append(
+        ReplayEvent(
+            kind="tool_call",
+            timestamp=None,
+            speaker="assistant",
+            summary="Write: file_b",
+            raw_type="assistant/tool_use",
+            metadata={"tool_name": "Write", "tool_use_id": "call_b"},
+            raw={},
+        )
+    )
+    # Result for call_b appears BEFORE call_a's result — pairing is by id, not order.
+    turn.tool_result_events.append(
+        ReplayEvent(
+            kind="tool_result",
+            timestamp=None,
+            speaker="tool",
+            summary="tool_result[call_b]: wrote b",
+            raw_type="user/tool_result",
+            metadata={"tool_use_id": "call_b"},
+            raw={},
+        )
+    )
+    turn.tool_result_events.append(
+        ReplayEvent(
+            kind="tool_result",
+            timestamp=None,
+            speaker="tool",
+            summary="tool_result[call_a]: read a",
+            raw_type="user/tool_result",
+            metadata={"tool_use_id": "call_a"},
+            raw={},
+        )
+    )
+    # An orphan result whose call lived in a prior turn → trailing un-indented.
+    turn.tool_result_events.append(
+        ReplayEvent(
+            kind="tool_result",
+            timestamp=None,
+            speaker="tool",
+            summary="tool_result[call_x]: orphan",
+            raw_type="user/tool_result",
+            metadata={"tool_use_id": "call_x"},
+            raw={},
+        )
+    )
+
+    rendered = render_grouped_plain([turn], compact=False)
+    lines = [line for line in rendered.splitlines() if line]
+
+    # Each result is indented two spaces immediately under its matching call.
+    assert lines.index("tool: Read: file_a") + 1 == lines.index("  result: tool_result[call_a]: read a")
+    assert lines.index("tool: Write: file_b") + 1 == lines.index("  result: tool_result[call_b]: wrote b")
+    # The orphan falls to a trailing un-indented result block.
+    assert "result: tool_result[call_x]: orphan" in lines
+    assert "  result: tool_result[call_x]: orphan" not in lines
+
+
 def test_compact_grouped_render_keeps_short_completed_result_compact() -> None:
     from claude_session_replay.models import ReplayEvent
 
